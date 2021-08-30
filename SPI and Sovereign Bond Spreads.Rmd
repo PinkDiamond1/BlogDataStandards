@@ -1,0 +1,500 @@
+---
+title: "SPI and Sovereign Bond Spreads"
+author: "Lucas Kitzmueller, Brian Stacy, Daniel Gerszon Mahler, Umar Serajuddin"
+date: "9/1/2021"
+
+output:
+  html_document:
+    css: custom.css
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+  knitr::opts_chunk$set(echo = TRUE)
+  knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+  # Libraries
+  library(tidyverse)
+  library(readxl)
+  library(ggExtra)
+  library(stargazer)
+  library(lfe)
+  library(taRifx)
+  library(scales)
+  library(writexl)
+  summarise <- dplyr::summarise
+
+```
+
+
+```{r load_spi_data, include=FALSE}
+# Load SPI data
+all_content = readLines("01_Data/spi_index_labelled-2021-07-22.csv")
+skip_second = all_content[-2] # remove labels
+spi = read.csv(textConnection(skip_second))
+spi <- spi %>% rename(year =  date)
+colnames(spi)[1] = "country"
+```
+
+```{r load_spread_data, include=FALSE}
+  # Load Bloomberg data
+
+  sp <- read_excel("01_Data/LIB127603_govt bond spreads_final.xlsx", 
+      sheet = "batch1")
+  # Data are 10 year govt bonds, yield to maturity, with US govt bonds as benchmark
+
+  # This reshaping is a bit unconventional but does the job. The problem is that the date varies across columns, and therefore we can't use "normal" pivot_longer() or gather()
+  
+  sp_dates <- pivot_longer(select(sp, contains("date")), contains("date"), names_to = "name_date", values_to = "date")
+  sp_dates$ID <- seq.int(nrow(sp_dates))
+  
+  sp_values <- pivot_longer(select(sp, contains("value")), contains("value"))
+  sp_values$ID <- seq.int(nrow(sp_dates))
+  
+  df <-  left_join(sp_dates, sp_values)
+  
+  # Clean up df
+  df$name <- substr(df$name,1,3)
+  df <- df %>% select(-c(ID, name_date))
+  df <- df %>% rename(iso3c =  name)
+  df <- df %>% rename(spread =  value)
+  df<-df[!(df$iso3c=="VEN"),] # remove venezuela
+  df<-df[!(df$iso3c=="ARG"),] # and argentina as huge outliers
+  
+  # Extract year from date variable and summarize by year
+  df$year <- format(df$date, format = "%Y")
+  df <- select(df,-c("date"))
+  
+  # Add USA (by definition, spread of 0)
+  usa<-tibble(year = c(2021,2020,2019,2018,2017,2016,2015),
+              iso3c = rep("USA",7),
+              spread = rep(0,7))
+  df <- rbind(df, usa)
+  
+  # Summarize by year
+  summary_df <- df %>%
+    group_by(year, iso3c) %>%
+    summarise(spread = mean(spread, na.rm = TRUE))
+  summary_df$year <- as.numeric(summary_df$year)
+
+  number_countries <- summary_df %>%
+    group_by(iso3c) %>%
+    summarise(n = n()) %>%
+    ungroup() %>%
+    summarise(n = n())
+```
+
+```{r load_wdi_data, include = FALSE}
+
+##########
+wdi <- read_csv("01_Data/68d48925-1dd3-4411-8121-9aca4e211ec9_Data.csv")
+
+wdi <- rename(wdi, country_wdi = "Country Name")
+wdi <- rename(wdi, iso3c = "Country Code")
+wdi <- rename(wdi, series = "Series Code")
+wdi <- wdi %>% select(-c("Series Name")) %>%
+  pivot_longer(!c(country_wdi, iso3c, series), names_to = "date", values_to = "value") 
+wdi$year <- substr(wdi$date, 1, 4)
+wdi <-  wdi %>% 
+  pivot_wider(names_from = series, values_from = value) %>%
+  unnest()
+wdi$year <- as.numeric(wdi$year)
+
+# select relevant series and years
+relevant_series = c("GC.DOD.TOTL.GD.ZS", "BN.CAB.XOKA.GD.ZS", "NY.GDP.MKTP.KD.ZG", "NY.GDP.PCAP.KD", "NE.TRD.GNFS.ZS", "FP.CPI.TOTL.ZG", "DT.DOD.DECT.GN.ZS")
+wdi <- wdi %>%
+  filter(year >= 2016 | year <= 2019) %>%
+  select(year, country_wdi, iso3c,relevant_series)
+
+wdi[,relevant_series] <- sapply(wdi[, relevant_series], as.numeric)
+
+wdi <- rename(wdi, prv_ctrl_govt_debt = "GC.DOD.TOTL.GD.ZS")
+wdi <- rename(wdi, prv_current_account_bal = "BN.CAB.XOKA.GD.ZS")
+wdi <- rename(wdi, prv_gdp_growth = "NY.GDP.MKTP.KD.ZG")
+wdi <- rename(wdi, prv_gdp_pcap = "NY.GDP.PCAP.KD")
+wdi <- rename(wdi, prv_trade = "NE.TRD.GNFS.ZS")
+wdi <- rename(wdi, prv_inflation = "FP.CPI.TOTL.ZG")
+wdi <- rename(wdi, prv_external_debt = "DT.DOD.DECT.GN.ZS")
+
+```
+
+```{r merge_data, include = FALSE}
+# merge SPI and spreads data
+df <- spi %>% left_join(summary_df, by = c("year","iso3c"))
+  not_merged_from_spreads <- df %>% filter(is.na(population) & !is.na(spread)) # Taiwan is not in the WDI
+  df <- df %>% filter(year > 2015 & year < 2020)
+  
+df <- df %>% left_join(wdi, by = c("year","iso3c"))
+    not_merged_from_wdi <- df %>% filter(is.na(region) & !is.na(prv_gdp_pcap)) # all merged
+    
+df$year <- as.factor(df$year)
+
+#df <- df %>%
+#  filter(year == filter_year)
+
+```
+
+```{r check_income_distribution of sample, include = FALSE}
+df_freq <- df %>%
+  filter(is.na(spread) == FALSE) %>%
+  group_by(iso3c) %>%
+  summarise(income = first(income))
+table(df_freq$income)
+```
+
+## Descriptive Statistics on the Adoption of International Standards 
+
+* Definition of sub-indicators and their levels:
+  + SNAU: System of national accounts in use. 
+    + Scoring: 1 point for using SNA2008 or ESA 2010, 0.5 points for using SNA 1993 or ESA 1995. 0 points otherwise
+  + NABY: National Accounts base year.
+    + 1 point for chained price, 0.5 for reference period within past 10 years. 0 points otherwise.
+  + CNIN: Classification of national industry.
+    + 1 Point if latest version is adopted (ISIC Rev 4, NACE Rev 2 or a compatible classification). 0.5 Points if previous version is used (ISIC Rev 3, NACE Rev 1 or a compatible classification). 0 points otherwise.
+  + CPIBY: CPI base year.
+    + 1 Point for annual chain linking. 0.5 Points if base year in last 10 years. 0 points otherwise.
+  + HOUS: Classification of household consumption.
+    + 1 Point if following Classification of Individual Consumption by Purpose (COICOP). 0 Points otherwise.
+  + EMPL: Classification of status of employment.
+    + 1 Point if following International Labour Organization, International Classification of Status in Employment (ICSE-93) or 2012 North American Industry Classification System (NAICS). 0 Points otherwise.
+  + CGOV: Central government accounting status.
+    + 1 Point if consolidated central government accounting follows non-cash recording basis. 0.5 Points if consolidated central government accounting follows cash recording basis. 0 Points otherwise.
+  + FINA: Compilation of government finance statistics.
+    + 1 Point if following the latest Government Finance Statistical Manual (2014)/ ESA2010. 0.5 Points if previous version is used (GFSM 2001). 0 points otherwise.
+  + MONY: Compilation of monetary and financial statistics.
+    + 1 Point if following the latest Monetary and Finance Statistics Manual (2000) or Monetary and Finance Statistics: Compilation Guide (2008/2016). 0 points otherwise.
+  + GSBP: Business process.
+    + 1 Point if GSBPM is in use. 0 points otherwise.
+
+
+```{r dim5_subindicators}
+# Code for reproducing the first figure of the blog
+
+df_d <- spi %>%
+  filter(year == 2019) %>%
+  select("SPI.D2.1.GDDS","SPI.D5.2.1.SNAU","SPI.D5.2.2.NABY","SPI.D5.2.3.CNIN","SPI.D5.2.4.CPIBY","SPI.D5.2.5.HOUS",	"SPI.D5.2.6.EMPL", "SPI.D5.2.7.CGOV","SPI.D5.2.8.FINA","SPI.D5.2.9.MONY","SPI.D5.2.10.GSBP","year", "country") %>%
+  pivot_longer(!c(country, year), names_to = "measure", values_to = "value") 
+df_d$value <- as.character(df_d$value)
+df_d$value[is.na(df_d$value)] = "NA"
+df_d$value <- as.factor(df_d$value)
+df_d <- df_d %>%
+  mutate(value = fct_relevel(value, 
+                             "NA", "0", "0.5", "1"))
+
+df_d$measure[df_d$measure == "SPI.D2.1.GDDS"] <- "SDDS/e-GDDS subscription (SPI 2.1)"
+df_d$measure[df_d$measure == "SPI.D5.2.1.SNAU"] <- "System of national accounts"
+df_d$measure[df_d$measure == "SPI.D5.2.2.NABY"] <- "National Accounts base year"
+df_d$measure[df_d$measure == "SPI.D5.2.3.CNIN"] <- "Classification of national industry"
+df_d$measure[df_d$measure == "SPI.D5.2.4.CPIBY"] <- "CPI base year"
+df_d$measure[df_d$measure == "SPI.D5.2.5.HOUS"] <- "Classification of household consumption"
+df_d$measure[df_d$measure == "SPI.D5.2.6.EMPL"] <- "Classification of status of employment"
+df_d$measure[df_d$measure == "SPI.D5.2.7.CGOV"] <- "Central government accounting status"
+df_d$measure[df_d$measure == "SPI.D5.2.8.FINA"] <- "Compilation of government finance statistics"
+df_d$measure[df_d$measure == "SPI.D5.2.9.MONY"] <- "Compilation of monetary and financial statistics"
+df_d$measure[df_d$measure == "SPI.D5.2.10.GSBP"] <- "Business process"
+
+df_d <- df_d %>%
+  group_by(measure,value) %>%
+  summarise(frequency = round(n()/218,2)) %>%
+  arrange(measure, desc(value))
+
+df_d$label <- c("GSBPM","Other","NA",
+              "Non-cash basis","Cash basis","Other","NA",
+              "COICOP","Other","NA",
+              "ISIC Rev 4/NACE Rev 2","ISIC Rev 3/NACE Rev 1","Other","NA",
+              "ICSE-93/NAICS","Other","NA",
+              "GFSM 2014/ESA2010","GFSM 2001","Other","NA",
+              "MFSM 2000/Finance Statistics: Compilation Guide 2008/2016","Other","NA",
+              "Annual chain linking","Base year within last 10 yrs","Other","NA",
+              "Chained price","Reference period within 10 yrs","Other",
+              "IMF SDDS+ or SDDS","e-GDDS","Other",
+              "SNA2008/ESA 2010","SNA 1993/ESA 1995","Other")
+df_d$measure <- as.factor(df_d$measure)
+df_d$measure <- factor(df_d$measure, levels= c("Classification of status of employment","Business process","Central government accounting status","Compilation of government finance statistics","CPI base year","National Accounts base year","Classification of household consumption","Classification of national industry","Compilation of monetary and financial statistics","SDDS/e-GDDS subscription (SPI 2.1)","System of national accounts"))
+df_d <- df_d[order(df_d$measure),]
+
+# Stacked + percent
+g <- ggplot(df_d, aes(fill=value, y=frequency, x=measure, label = label)) + 
+  geom_bar(position="fill", stat="identity",alpha=0.95) +
+  geom_text(size = 3, position = position_stack(vjust = 0.5)) +
+  labs(y = "Share of Countries",
+       x = "") +
+  theme_minimal() +
+  coord_flip() +
+  scale_y_continuous(breaks = seq(0, 1, .2), 
+                     label = percent) +
+  scale_fill_brewer() +
+  theme(legend.position = "none",            
+        axis.text.y = element_text(size=11),
+        panel.grid.major.y = element_blank())
+g
+
+ggsave("02_Figs/01_adoption_of_standards.png",
+       width = 10,
+       height = 5)
+
+```
+Definition of Dimension 5.2 from SPI Technical Note:
+
+> Dimension 5.2: Standards and Methods: This set of indicators is based on countries’ use of internationally accepted and recommended methodologies, classifications and standards regarding data integration. These indicators help facilitate data exchange and provide the foundation for the preparation of relevant statistical indicators. The following methods and standards are considered: System of national accounts in use, National Accounts base year, Classification of national industry, CPI base year, Classification of household consumption, Classification of status of employment, Central government accounting status, Compilation of government finance statistics, Compilation of monetary and financial statistics, Business process. Further work could improve the validity of this indicator and reduce the risk that countries may be incentivized to adopt only traditional standards and methods and neglect innovative solutions that may be more valid in the current context.
+
+```{r dim52_by_income_year}
+
+# Code for reproducing the second figure of the blog
+df_g <- spi %>%
+    group_by(year, income) %>%
+    summarise(mean = mean(SPI.DIM5.2.INDEX,na.rm = T))
+
+df_g <- df_g %>%
+  mutate(income = fct_relevel(income, levels =  "Low income", "Lower middle income","Upper middle income", "High income"))
+
+  g <- df_g %>%
+    ggplot(aes(x = year, y = mean, color = income)) +
+    geom_point() +
+    geom_line() +
+    theme_minimal() +
+    scale_color_viridis_d(guide = guide_legend(reverse = TRUE)) +
+    #labs(title="Dim 5.2: Standards and Methods") +
+    ylab("Adoption of International Standards and Methods \n (SPI Dimension 5.2)")+
+    xlab("") +
+    scale_y_continuous(breaks=seq(0,1,by=0.2), limits = c(0,1), labels=c("0","0.2","0.4","0.6","0.8","1")) +
+    xlim(2016,2019) +
+    theme(legend.title = element_blank(),
+          panel.grid = element_line(colour = NULL), 
+          #panel.grid.major = element_line(colour = "#BEBEBE"), 
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank()) 
+
+  g
+  
+  ggsave("02_Figs/04_adoption_of_standards_by_income.png",
+       width = 6,
+       height = 4)
+```
+
+
+```{r latest_standards_by_income, meassage = TRUE}
+
+# Stats on lack of adoption by income group
+
+df_h <- spi %>%
+  filter(year == 2019) %>%
+  select("SPI.D2.1.GDDS","SPI.D5.2.1.SNAU","SPI.D5.2.2.NABY","SPI.D5.2.3.CNIN","SPI.D5.2.4.CPIBY","SPI.D5.2.5.HOUS",	"SPI.D5.2.6.EMPL", "SPI.D5.2.7.CGOV","SPI.D5.2.8.FINA","SPI.D5.2.9.MONY","SPI.D5.2.10.GSBP","year", "country", "income") %>%
+  pivot_longer(!c(country, year, income), names_to = "measure", values_to = "value") 
+df_h$value <- replace(df_h$value, 0.5, 0) # only consider latest standard
+df_h <- df_h %>%
+  group_by(country) %>%
+  summarise(value = mean(value, na.rm = TRUE), #share of latest indicators adopted by each country
+            income = first(income)) %>%
+  mutate(at_least_half = (value >= 0.5)) %>% #create dummy if adopted more than half
+  group_by(income) %>%
+  summarise(value = mean(value, na.rm = TRUE),
+            at_least_half = mean(at_least_half, na.rm = TRUE))
+print("The lack of international standards is particularly severe among poorer countries. Whereas 59% of high-income countries comply with at least half of the most recent standards in dimension 5.2, this only applies to 28% of lower-middle-income and 7% of low-income countries.")
+#print(df_h)
+```
+
+## Correlation of SPI Pillar 5 - Dimension 2 with Government Bond Spreads
+
+```{r correlation_dim52_spreads}
+# Replication of the third figure of the blog
+
+df <- df %>%
+  mutate(income = fct_relevel(income, levels =  "Low income", "Lower middle income","Upper middle income", "High income"))
+df_52 <- df %>%
+  arrange(year) %>%
+  group_by(iso3c) %>%
+  summarise(SPI.DIM5.2.INDEX = mean(SPI.DIM5.2.INDEX,na.rm=TRUE),
+            spread = mean(spread,na.rm=TRUE),
+            income = last(income))
+
+g <- df_52 %>%
+  ggplot(aes(x=SPI.DIM5.2.INDEX, y=spread, color = income)) + #df[(df$year == 2019),]
+      geom_smooth(method='lm', color = "black") +
+      geom_point(alpha = 0.5) +
+      xlim(0.15,1) +
+      scale_color_viridis_d() +
+      theme_minimal() +
+      ylab("Average 10-Year Government Bond Spread 2015-2019")+
+      xlab("SPI Dimension 5.2: Adoption of International Standards and Methods, Average 2015-2019") +
+      labs(colour = "Income level:") +
+      theme(legend.position = "bottom") +
+    labs(caption = "")
+    
+  g
+  ggsave("02_Figs/02_correlation_SPI52_spreads.png",
+         width = 7,
+         height = 5)
+  
+```
+````{r interquartile_increase}
+# Statistic on impact of moving two quartiles
+
+spi_52_interquartile_range <- summary(df$SPI.DIM5.2.INDEX)["1st Qu."] - summary(df$SPI.DIM5.2.INDEX)["3rd Qu."]
+fit = lm(spread~SPI.DIM5.2.INDEX,df_52)
+reduc_corr_with_spi_52_interquart_range = fit$coefficients[2] * spi_52_interquartile_range
+print(paste("Increase in SPI Dimension 5.2 from 1st to 3rd quartile is associated with a decrease in government bond spread by (in bps):", reduc_corr_with_spi_52_interquart_range))
+````
+
+
+## Correlation of SPI Pillar 5 - Dimension 2 with Government Bond Spreads Conditional on Macroeconomic Factors
+
+Data:
+
+* <b>Dependent variable: Spread data of 10 yr govt bonds from 50 countries</b> 
+  + Benchmarked to 10 yr govt of US
+  + Data gathered from Bloomberg LP 
+  + Measured in yield to maturity
+* <b>Independent variables of interest: </b>
+  + Statistical Performance Indicator (SPI)
+  + SPI Pillar 5
+  + SPI Dimension 5.2
+  + SPI Dimension 5.2 subindicators
+* <b>Other predictor/control variables from WDI (similar as in Kubota & Zeufack, 2020):</b>
+  + GDP per capita (in US dollars at 2010 prices)
+  + GDP growth (annual %)
+  + Central government debt, total (% of GDP)
+  + Current account balance (% of GDP)
+  + Trade (% of GDP)
+  + Inflation, consumer prices (annual %)
+  + External debt stocks (% of GNI)
+
+To deal with missing values in control variables, missing values are recoded to zero and added as dummies indicating missingness (the variables ending with "_mi"). 
+
+````{r add_missing_dummies}
+#create missingness idnicators (loop!)
+df$prv_ctrl_govt_debt_mi <- as.numeric(is.na(df$prv_ctrl_govt_debt))
+df$prv_ctrl_govt_debt <- replace(df$prv_ctrl_govt_debt, is.na(df$prv_ctrl_govt_debt), 0)
+df$prv_current_account_bal_mi <- as.numeric(is.na(df$prv_current_account_bal))
+df$prv_current_account_bal <- replace(df$prv_current_account_bal, is.na(df$prv_current_account_bal), 0)
+df$prv_gdp_growth_mi <- as.numeric(is.na(df$prv_gdp_growth))
+df$prv_gdp_growth <- replace(df$prv_gdp_growth, is.na(df$prv_gdp_growth), 0)
+df$prv_gdp_pcap_mi <- as.numeric(is.na(df$prv_gdp_pcap))
+df$prv_gdp_pcap <- replace(df$prv_gdp_pcap, is.na(df$prv_gdp_pcap), 0)
+df$prv_trade_mi <- as.numeric(is.na(df$prv_trade))
+df$prv_trade <- replace(df$prv_trade, is.na(df$prv_trade), 0)
+df$prv_inflation_mi <- as.numeric(is.na(df$prv_inflation))
+df$prv_inflation <- replace(df$prv_inflation, is.na(df$prv_inflation), 0)
+df$prv_external_debt_mi <- as.numeric(is.na(df$prv_external_debt))
+df$prv_external_debt <- replace(df$prv_external_debt, is.na(df$prv_external_debt), 0)
+````
+
+````{r ss}
+
+df_d$measure[df_d$measure == "SPI.D2.1.GDDS"] <- "SDDS/e-GDDS subscription"
+df_d$measure[df_d$measure == "SPI.D5.2.1.SNAU"] <- "System of national accounts"
+df_d$measure[df_d$measure == "SPI.D5.2.2.NABY"] <- "National Accounts base year"
+df_d$measure[df_d$measure == "SPI.D5.2.3.CNIN"] <- "Classification of national industry"
+df_d$measure[df_d$measure == "SPI.D5.2.4.CPIBY"] <- "CPI base year"
+df_d$measure[df_d$measure == "SPI.D5.2.5.HOUS"] <- "Classification of household consumption"
+df_d$measure[df_d$measure == "SPI.D5.2.6.EMPL"] <- "Classification of status of employment"
+df_d$measure[df_d$measure == "SPI.D5.2.7.CGOV"] <- "Central government accounting status"
+df_d$measure[df_d$measure == "SPI.D5.2.8.FINA"] <- "Compilation of government finance statistics"
+df_d$measure[df_d$measure == "SPI.D5.2.9.MONY"] <- "Compilation of monetary and financial statistics"
+df_d$measure[df_d$measure == "SPI.D5.2.10.GSBP"] <- "Business process"
+
+````
+
+```{r estimation_function}
+
+controls <- "prv_gdp_pcap+prv_current_account_bal+prv_gdp_growth+prv_trade+prv_inflation+prv_external_debt+prv_ctrl_govt_debt+prv_gdp_pcap_mi+prv_current_account_bal_mi+prv_gdp_growth_mi+prv_trade_mi+prv_inflation_mi+prv_external_debt_mi+prv_ctrl_govt_debt_mi | year"
+
+estimate_effects <- function(dep_var,data) {
+  
+  controls <- "prv_gdp_pcap+prv_current_account_bal+prv_gdp_growth+prv_trade+prv_inflation+prv_external_debt+prv_ctrl_govt_debt+prv_gdp_pcap_mi+prv_current_account_bal_mi+prv_gdp_growth_mi+prv_trade_mi+prv_inflation_mi+prv_external_debt_mi+prv_ctrl_govt_debt_mi | year"
+  
+  fit = felm(as.formula(paste0("spread ~ ",dep_var," + ", controls)), data = data)
+  
+  label_character <- paste(dep_var)
+  result_vector <- c(label_character,
+                     round(fit$coefficients[1], digits = 3), 
+                     (round(fit$coefficients[1]+1.96*fit$se[1], digits = 3)), 
+                     (round(fit$coefficients[1]-1.96*fit$se[1], digits = 3)),
+                     round(fit$se[1], digits = 3),
+                     fit$pval[1] 
+  )
+  result_vector
+  return(result_vector)
+}
+
+```
+
+
+```{r spi_dim52_regs_subindicators, echo=FALSE, results='asis'}
+
+#df$SPI.INDEX.SCALED <- df$SPI.INDEX/100
+lm.SPI52 <- estimate_effects("SPI.DIM5.2.INDEX",df)
+lm.0 <- estimate_effects("SPI.D2.1.GDDS",df)
+lm.1 <- estimate_effects("SPI.D5.2.1.SNAU",df)
+lm.2 <- estimate_effects("SPI.D5.2.2.NABY",df)
+lm.3 <- estimate_effects("SPI.D5.2.3.CNIN",df)
+lm.4 <- estimate_effects("SPI.D5.2.4.CPIBY",df)
+lm.5 <- estimate_effects("SPI.D5.2.5.HOUS",df)
+lm.6 <- estimate_effects("SPI.D5.2.6.EMPL",df)
+lm.7 <- estimate_effects("SPI.D5.2.7.CGOV",df)
+lm.8 <- estimate_effects("SPI.D5.2.8.FINA",df)
+lm.9 <- estimate_effects("SPI.D5.2.9.MONY",df)
+lm.10 <- estimate_effects("SPI.D5.2.10.GSBP",df)
+
+df_pp <- as_tibble(rbind(lm.SPI52,
+                           lm.0,lm.1,lm.2,lm.3,lm.4,lm.5,
+                           lm.6,lm.7,lm.8,lm.9,lm.10)) # lm.SPI
+df_pp$V2 <- as.numeric(df_pp$V2)
+df_pp <- rename(df_pp, beta =  V2)
+df_pp$SPI.DIM5.2.INDEX <- as.numeric(df_pp$SPI.DIM5.2.INDEX)
+df_pp <- rename(df_pp, upper =  SPI.DIM5.2.INDEX)
+df_pp$V4 <- as.numeric(df_pp$V4)
+df_pp <- rename(df_pp, lower =  V4)
+df_pp <- rename(df_pp, measure =  V1)
+
+# Scale 
+#spi_interquartile_range <- summary(df$SPI.INDEX)[5] - summary(df$SPI.INDEX)[2]
+#df_pp$beta[df_pp$measure == "SPI.INDEX.SCALED"] <- (df_pp$beta/spi_interquartile_range)
+#df_pp$upper[df_pp$measure == "SPI.INDEX.SCALED"] <- df_pp$beta[df_pp$measure == "SPI.INDEX.SCALED"]+(1.96 * df_pp$V5[df_pp$measure == "SPI.INDEX.SCALED"])
+
+df_pp$measure[df_pp$measure == "SPI.D2.1.GDDS"] <- "SDDS subscription (SPI 2.1)"
+df_pp$measure[df_pp$measure == "SPI.D5.2.1.SNAU"] <- "System of national accounts"
+df_pp$measure[df_pp$measure == "SPI.D5.2.2.NABY"] <- "National Accounts base year"
+df_pp$measure[df_pp$measure == "SPI.D5.2.3.CNIN"] <- "Classification of national industry"
+df_pp$measure[df_pp$measure == "SPI.D5.2.4.CPIBY"] <- "CPI base year"
+df_pp$measure[df_pp$measure == "SPI.D5.2.5.HOUS"] <- "Classification of household consumption"
+df_pp$measure[df_pp$measure == "SPI.D5.2.6.EMPL"] <- "Classification of status of employment"
+df_pp$measure[df_pp$measure == "SPI.D5.2.7.CGOV"] <- "Central government accounting status"
+df_pp$measure[df_pp$measure == "SPI.D5.2.8.FINA"] <- "Compilation of government finance statistics"
+df_pp$measure[df_pp$measure == "SPI.D5.2.9.MONY"] <- "Compilation of monetary and financial statistics"
+df_pp$measure[df_pp$measure == "SPI.D5.2.10.GSBP"] <- "Business process"
+df_pp$measure[df_pp$measure == "SPI.INDEX.SCALED"] <- "Overall SPI Index"
+df_pp$measure[df_pp$measure == "SPI.DIM5.2.INDEX"] <- "SPI Dimension 5.2: International Standards"
+
+df_pp$measure <- factor(df_pp$measure, levels= c("Classification of status of employment","Business process","Central government accounting status","Compilation of government finance statistics","CPI base year","National Accounts base year","Classification of household consumption","Classification of national industry","Compilation of monetary and financial statistics","SDDS subscription (SPI 2.1)","System of national accounts","SPI Dimension 5.2: International Standards","Overall SPI Index"))
+
+
+g <- df_pp %>%
+  ggplot(aes(x = measure, y = beta)) +
+  geom_hline(yintercept = 0, color = "black", size=0.5, linetype = "dotted") +
+  geom_errorbar(aes(ymin = lower, max = upper), width = 0.2, color = "darkred") +
+    geom_point(stat = "identity") +
+  geom_text(aes(label = round(beta)), color = "black", vjust = -0.75, hjust = 0.5, show.legend = FALSE, size = 2.5) +
+  theme_minimal()+
+  coord_flip() +
+  scale_y_continuous(name = "Associated decrease with 10-yr government bond spread  \n (in bps) conditional on other determinants of spreads")  +
+  scale_x_discrete(name = "") +
+  theme(legend.position="bottom") +
+  theme(legend.title = element_blank()) +
+  scale_color_brewer(palette="Set1") + 
+  theme(axis.text.y  = element_text(size=11),
+        axis.text.x  = element_text(size=11),
+        axis.title.x = element_text(size = 11),
+        axis.title.y = element_text(size = 11))
+g
+
+ggsave("02_Figs/03_correlation_SPI52_spreads.png",
+       width = 9,
+       height = 5)
+```
+````{r reported_effect}
+
+spi_52_interquartile_range <- summary(df$SPI.DIM5.2.INDEX)["3rd Qu."] - summary(df$SPI.DIM5.2.INDEX)["1st Qu."]
+stat1 <- (df_pp$beta[df_pp$measure == "SPI Dimension 5.2: International Standards"]*spi_52_interquartile_range)
+print(paste("We find that conditional on the macroeconomic fundamental and changes in the global market environments, an increase in the adoption of international standards from the first to third quartile of SPI Dimension 5.2 is correlated with a decrease in government bond spreads by (in bps): ",stat1))
+`````
